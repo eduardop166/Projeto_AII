@@ -5,19 +5,24 @@
 V = double(analyze75read(fullfile(path, hdr)));
 
 % slices em que aparece o CC (escolhidas manualmente)
-z = round(linspace(61, 71, 10));
+z = round(linspace(64, 74, 10));
 
 % guardar máscaras
-masks = cell(1, numel(z));
+masksSeed  = cell(1, numel(z));   % máscara para seed (do active contour)
+masksFinal = cell(1, numel(z));   % máscara final (depois do recorte + binarização)
+
 
 % parâmetros 
-sigma = 1.2;        % suavização gaussiana (0.8-2.0)
+sigma = 1.3;        % suavização gaussiana (0.8-2.0)
 percSeed = 92;      % percentil para seed (88-95)
 itersFirst = 70;   % iterações primeira slice
 itersNext  = 100;    % iterações seguintes (porque usa seed anterior)
 minArea = 120;      % remove blobs pequenos
 
-figure;
+figAC   = figure('Name','(1) Sn + Active Contour mask');
+figMask = figure('Name','(2) Sn recortada pela máscara');
+figBin  = figure('Name','(3) Depois da binarização');
+
 for i = 1:numel(z)
 
     % obter slice e rodar 
@@ -28,15 +33,30 @@ for i = 1:numel(z)
     p = prctile(S(:), [2 98]);
     Sn = (S - p(1)) / (p(2)-p(1) + eps);
     Sn = min(max(Sn,0),1);
-    Sn = imgaussfilt(Sn, sigma);
+    
+    % melhor que gaussian forte: suaviza mas preserva bordas
+    Sn = imbilatfilt(Sn, 0.06, 3);   % ajusta: (0.04–0.10) e (2–5)
 
+    Sn = imgaussfilt(Sn, 0.6);
+    
     [H,W] = size(Sn);
 
-    % ROI central
-    % (CC costuma estar na zona central, um pouco acima do meio)
-    x1 = round(0.30*W); x2 = round(0.70*W);
-    y1 = round(0.30*H); y2 = round(0.70*H);
-    R  = Sn(y1:y2, x1:x2);
+
+    % ROI (dinâmica a partir da slice anterior)
+    if i > 1 && ~isempty(masksSeed{i-1}) && nnz(masksSeed{i-1}) > 0
+        prevFull = masksSeed{i-1};
+        [rr, cc] = find(prevFull);
+        pad = 15; % margem em pixels
+    
+        y1 = max(min(rr)-pad, 1);  y2 = min(max(rr)+pad, H);
+        x1 = max(min(cc)-pad, 1);  x2 = min(max(cc)+pad, W);
+    else
+        % ROI central na 1ª slice (ou se a anterior falhar)
+        x1 = round(0.30*W); x2 = round(0.70*W);
+        y1 = round(0.30*H); y2 = round(0.70*H);
+    end
+    
+    R = Sn(y1:y2, x1:x2);
 
     % seed
     if i == 1
@@ -49,7 +69,7 @@ for i = 1:numel(z)
         init = bwareaopen(init, minArea);
     else
         % seed = máscara anterior
-        initPrev = masks{i-1};
+        initPrev = masksSeed{i-1};
         init = initPrev(y1:y2, x1:x2);
 
         % pequena dilatação para dar "margem" ao contorno
@@ -70,7 +90,7 @@ for i = 1:numel(z)
     if i == 1
         bw = activecontour(R, init, itersFirst, "Chan-Vese");
     else
-        bw = activecontour(R, init, itersNext, "Chan-Vese");
+        bw = activecontour(R, init, itersNext, "Chan-Vese","SmoothFactor", 1.8, "ContractionBias", 0.15);
     end
 
     % pós-processamento: manter componente mais central
@@ -95,12 +115,51 @@ for i = 1:numel(z)
     % colocar no tamanho total da slice
     maskFull = false(H,W);
     maskFull(y1:y2, x1:x2) = bw;
-    masks{i} = maskFull;
+    
+    % guardar máscara para seed (active contour)
+    masksSeed{i} = maskFull;
+    
+    % recortar a máscara e binarizar
+    
+    % 1) recorte (fora da máscara -> 0)
+    SnMasked = Sn;
+    SnMasked(~maskFull) = 0;
+    
+    % 2) threshold (Otsu calculado só dentro da máscara)
+    pix = SnMasked(maskFull);
+    thr= 0.7;
+    
+    bwFinal = (SnMasked > thr) & maskFull;
+    
+    % 3) limpeza leve
+    bwFinal = bwareaopen(bwFinal, minArea);
+    bwFinal = imfill(bwFinal,'holes');
+    
+    % guardar máscara final
+    masksFinal{i} = bwFinal;
 
-    % Mostrar
+
+    % FIGURA 1: Sn + mask AC (como antes)
+    figure(figAC);
     subplot(2,5,i);
     imagesc(Sn); axis image off; colormap gray; hold on;
     contour(maskFull, [0.5 0.5], 'r', 'LineWidth', 1);
     title(sprintf('Slice %d (z=%d)', i, z(i)));
+    hold off;
+    
+    % FIGURA 2: Sn recortada pela máscara (fora = 0)
+    figure(figMask);
+    subplot(2,5,i);
+    imagesc(SnMasked); axis image off; colormap gray;
+    title(sprintf('Recorte z=%d', z(i)));
+
+    % FIGURA 3: Depois da binarização (máscara final)
+
+    figure(figBin);
+    subplot(2,5,i);
+    imagesc(masksFinal{i}); axis image off; colormap gray;
+    title(sprintf('Binarizado z=%d', z(i)));
+    
     drawnow
+
 end
