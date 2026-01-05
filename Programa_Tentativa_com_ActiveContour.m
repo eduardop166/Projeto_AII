@@ -5,7 +5,7 @@
 V = double(analyze75read(fullfile(path, hdr)));
 
 % slices em que aparece o CC (escolhidas manualmente)
-z = round(linspace(64, 74, 10));
+z = round(linspace(61, 71, 10));
 
 % guardar máscaras
 masksSeed  = cell(1, numel(z));   % máscara para seed (do active contour)
@@ -161,5 +161,6 @@ for i = 1:numel(z)
     title(sprintf('Binarizado z=%d', z(i)));
     
     drawnow
+
 
 end
