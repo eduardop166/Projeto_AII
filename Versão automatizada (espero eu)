@@ -1,0 +1,226 @@
+% PROJETO 2 - CC segmentation (baseline Active Contour) - VERSÃO MELHORADA
+
+[hdr, path] = uigetfile('*.hdr');
+V = double(analyze75read(fullfile(path, hdr)));
+
+fprintf('A detetar slices com Corpus Callosum...\n');
+
+[H, W, numSlices] = size(V);
+
+scores = zeros(numSlices, 1);
+for zz = 1:numSlices
+    S = squeeze(V(:,:,zz));
+    S = rot90(S, 2);
+    
+    p = prctile(S(:), [2 98]);
+    Sn = (S - p(1)) / (p(2) - p(1) + eps);
+    Sn = min(max(Sn, 0), 1);
+    
+    y1 = round(0.25*H); y2 = round(0.55*H);
+    x1 = round(0.30*W); x2 = round(0.70*W);
+    
+    roi = Sn(y1:y2, x1:x2);
+    
+    brightPixels = roi(roi > prctile(roi(:), 75));
+    scores(zz) = mean(brightPixels);
+end
+
+scoresSmooth = movmean(scores, 5);
+
+threshold = prctile(scoresSmooth, 60);
+candidateSlices = find(scoresSmooth > threshold);
+
+if isempty(candidateSlices)
+    error('Não foi possível detetar slices com CC. Ajusta o threshold.');
+end
+
+diff_slices = diff(candidateSlices);
+gaps = find(diff_slices > 2);
+
+if ~isempty(gaps)
+    groups = {};
+    startIdx = 1;
+    for g = 1:length(gaps)
+        groups{g} = candidateSlices(startIdx:gaps(g));
+        startIdx = gaps(g) + 1;
+    end
+    groups{end+1} = candidateSlices(startIdx:end);
+    
+    [~, maxGroup] = max(cellfun(@length, groups));
+    candidateSlices = groups{maxGroup};
+end
+
+numSlicesToUse = min(10, length(candidateSlices));
+z = candidateSlices(round(linspace(1, length(candidateSlices), numSlicesToUse)));
+
+fprintf('Slices selecionados: %s\n', mat2str(z));
+
+figure('Name', 'Deteção de Slices');
+plot(1:numSlices, scoresSmooth, 'b-', 'LineWidth', 1.5); hold on;
+plot(z, scoresSmooth(z), 'ro', 'MarkerSize', 8, 'LineWidth', 2);
+yline(threshold, 'r--', 'Threshold');
+xlabel('Slice number'); ylabel('Score (intensidade)');
+title('Deteção automática de slices com CC');
+legend('Score suavizado', 'Slices selecionados', 'Threshold');
+grid on;
+
+masksSeed  = cell(1, numel(z));
+masksFinal = cell(1, numel(z));
+
+percSeed = 92;
+itersFirst = 80;
+itersNext  = 120;
+minArea = 100;
+
+figAC   = figure('Name','(1) Sn + Active Contour mask');
+figMask = figure('Name','(2) Sn recortada pela máscara');
+figBin  = figure('Name','(3) Máscara final binarizada');
+
+for i = 1:numel(z)
+    
+    S = squeeze(V(:,:,z(i)));
+    S = rot90(S, 2);
+    
+    p = prctile(S(:), [1 99]);
+    Sn = (S - p(1)) / (p(2) - p(1) + eps);
+    Sn = min(max(Sn, 0), 1);
+    
+    Sn = imbilatfilt(Sn, 0.05, 3);
+    Sn = imgaussfilt(Sn, 0.5);
+    Sn = adapthisteq(Sn, 'ClipLimit', 0.01, 'Distribution', 'uniform');
+    
+    [H, W] = size(Sn);
+    
+    if i > 1 && ~isempty(masksSeed{i-1}) && nnz(masksSeed{i-1}) > 0
+        prevFull = masksSeed{i-1};
+        [rr, cc] = find(prevFull);
+        pad = 20;
+        
+        y1 = max(min(rr)-pad, 1);  y2 = min(max(rr)+pad, H);
+        x1 = max(min(cc)-pad, 1);  x2 = min(max(cc)+pad, W);
+    else
+        x1 = round(0.25*W); x2 = round(0.75*W);
+        y1 = round(0.25*H); y2 = round(0.60*H);
+    end
+    
+    R = Sn(y1:y2, x1:x2);
+    
+    if i == 1
+        t = prctile(R(:), percSeed);
+        init = R > t;
+        
+        init = imopen(init, strel('disk', 2));
+        init = imclose(init, strel('disk', 6));
+        init = imfill(init, 'holes');
+        init = bwareaopen(init, minArea);
+        init = imclearborder(init);
+        
+    else
+        initPrev = masksSeed{i-1};
+        init = initPrev(y1:y2, x1:x2);
+        init = imdilate(init, strel('disk', 3));
+    end
+    
+    if nnz(init) < 50
+        t = prctile(R(:), percSeed);
+        init = R > t;
+        init = imopen(init, strel('disk', 2));
+        init = imclose(init, strel('disk', 6));
+        init = imfill(init, 'holes');
+        init = bwareaopen(init, minArea);
+        init = imclearborder(init);
+    end
+    
+    if i == 1
+        bw = activecontour(R, init, itersFirst, "Chan-Vese", ...
+                          "SmoothFactor", 2.0, "ContractionBias", 0.1);
+    else
+        bw = activecontour(R, init, itersNext, "Chan-Vese", ...
+                          "SmoothFactor", 2.0, "ContractionBias", 0.2);
+    end
+    
+    bw = imfill(bw, 'holes');
+    bw = bwareaopen(bw, minArea);
+    
+    CC = bwconncomp(bw);
+    if CC.NumObjects > 0
+        stats = regionprops(CC, 'Area', 'Centroid', 'Eccentricity', 'Solidity');
+        
+        cent = vertcat(stats.Centroid);
+        area = vertcat(stats.Area);
+        eccen = vertcat(stats.Eccentricity);
+        solid = vertcat(stats.Solidity);
+        
+        c0 = [size(R,2)/2, size(R,1)/2];
+        d = hypot(cent(:,1)-c0(1), cent(:,2)-c0(2));
+        
+        score = area .* (1./(1+d)) .* eccen .* solid;
+        [~, k] = max(score);
+        
+        bw2 = false(size(bw));
+        bw2(CC.PixelIdxList{k}) = true;
+        bw = bw2;
+    end
+    
+    maskFull = false(H, W);
+    maskFull(y1:y2, x1:x2) = bw;
+    
+    masksSeed{i} = maskFull;
+    
+    SnMasked = Sn;
+    SnMasked(~maskFull) = 0;
+    
+    pix = SnMasked(maskFull);
+    
+    if length(pix) > 100
+        thr = graythresh(pix) * 0.95;
+    else
+        thr = 0.65;
+    end
+    
+    bwFinal = (SnMasked > thr) & maskFull;
+    
+    bwFinal = imerode(bwFinal, strel('disk', 1));
+    bwFinal = bwareaopen(bwFinal, minArea);
+    
+    CC2 = bwconncomp(bwFinal);
+    if CC2.NumObjects > 1
+        stats2 = regionprops(CC2, 'Area', 'Centroid');
+        cent2 = vertcat(stats2.Centroid);
+        area2 = vertcat(stats2.Area);
+        
+        c0 = [W/2, H/2];
+        d2 = hypot(cent2(:,1)-c0(1), cent2(:,2)-c0(2));
+        
+        [~, k2] = max(area2 .* (1./(1+d2)));
+        bwTemp = false(size(bwFinal));
+        bwTemp(CC2.PixelIdxList{k2}) = true;
+        bwFinal = bwTemp;
+    end
+    
+    bwFinal = imfill(bwFinal, 'holes');
+    bwFinal = imdilate(bwFinal, strel('disk', 1));
+    
+    masksFinal{i} = bwFinal;
+    
+    figure(figAC);
+    subplot(2, 5, i);
+    imagesc(Sn); axis image off; colormap gray; hold on;
+    contour(maskFull, [0.5 0.5], 'r', 'LineWidth', 1.5);
+    title(sprintf('Slice %d (z=%d)', i, z(i)));
+    hold off;
+    
+    figure(figMask);
+    subplot(2, 5, i);
+    imagesc(SnMasked); axis image off; colormap gray;
+    title(sprintf('Recorte z=%d', z(i)));
+    
+    figure(figBin);
+    subplot(2, 5, i);
+    imagesc(bwFinal); axis image off; colormap gray;
+    title(sprintf('Final z=%d', z(i)));
+    
+    drawnow;
+end
+
+fprintf('Segmentação completa!\n');
