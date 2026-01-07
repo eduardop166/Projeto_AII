@@ -1,0 +1,178 @@
+% PROJETO 2 - CC segmentation (SAM com prompts automáticos + rápido) - VERSÃO MELHORADA
+
+model = segmentAnythingModel;
+
+[hdr, path] = uigetfile('*.hdr');
+V = double(analyze75read(fullfile(path, hdr)));
+
+fprintf('A detetar slices com Corpus Callosum...\n');
+
+[H, W, numSlices] = size(V);
+
+scores = zeros(numSlices, 1);
+for zz = 1:numSlices
+    S = squeeze(V(:,:,zz));
+    S = rot90(S, 2);
+    
+    p = prctile(S(:), [2 98]);
+    Sn = (S - p(1)) / (p(2) - p(1) + eps);
+    Sn = min(max(Sn, 0), 1);
+    
+    y1 = round(0.25*H); y2 = round(0.55*H);
+    x1 = round(0.30*W); x2 = round(0.70*W);
+    
+    roi = Sn(y1:y2, x1:x2);
+    
+    brightPixels = roi(roi > prctile(roi(:), 75));
+    scores(zz) = mean(brightPixels);
+end
+
+scoresSmooth = movmean(scores, 5);
+
+threshold = prctile(scoresSmooth, 60);
+candidateSlices = find(scoresSmooth > threshold);
+
+if isempty(candidateSlices)
+    error('Não foi possível detetar slices com CC. Ajusta o threshold.');
+end
+
+diff_slices = diff(candidateSlices);
+gaps = find(diff_slices > 2);
+
+if ~isempty(gaps)
+    groups = {};
+    startIdx = 1;
+    for g = 1:length(gaps)
+        groups{g} = candidateSlices(startIdx:gaps(g));
+        startIdx = gaps(g) + 1;
+    end
+    groups{end+1} = candidateSlices(startIdx:end);
+    
+    [~, maxGroup] = max(cellfun(@length, groups));
+    candidateSlices = groups{maxGroup};
+end
+
+numSlicesToUse = min(10, length(candidateSlices));
+z = candidateSlices(round(linspace(1, length(candidateSlices), numSlicesToUse)));
+
+fprintf('Slices selecionados: %s\n', mat2str(z));
+
+figure('Name', 'Deteção de Slices');
+plot(1:numSlices, scoresSmooth, 'b-', 'LineWidth', 1.5); hold on;
+plot(z, scoresSmooth(z), 'ro', 'MarkerSize', 8, 'LineWidth', 2);
+yline(threshold, 'r--', 'Threshold');
+xlabel('Slice number'); ylabel('Score (intensidade)');
+title('Deteção automática de slices com CC');
+legend('Score suavizado', 'Slices selecionados', 'Threshold');
+grid on;
+
+masks = cell(1, numel(z));
+
+sigma = 1;
+scale = 0.5;
+
+figure('Name', 'Segmentação SAM');
+for i = 1:numel(z)
+    
+    S = squeeze(V(:,:,z(i)));
+    S = rot90(S,2);
+    
+    p = prctile(S(:), [2 98]);
+    Sn = (S - p(1)) / (p(2)-p(1) + eps);
+    Sn = min(max(Sn,0),1);
+    Sn = imgaussfilt(Sn, sigma);
+    
+    [H,W] = size(Sn);
+    
+    if i > 1 && ~isempty(masks{i-1}) && nnz(masks{i-1}) > 0
+        prevMask = rot90(masks{i-1}, 2);
+        [rr, cc] = find(prevMask);
+        pad = 20;
+        
+        x1 = max(min(cc)-pad, 1);
+        x2 = min(max(cc)+pad, W);
+        y1 = max(min(rr)-pad, 1);
+        y2 = min(max(rr)+pad, H);
+    else
+        x1 = round(0.35*W); x2 = round(0.75*W);
+        y1 = round(0.28*H); y2 = round(0.62*H);
+    end
+    
+    R  = Sn(y1:y2, x1:x2);
+    [hR,wR] = size(R);
+    
+    [~, idxMax] = max(R(:));
+    [py, px] = ind2sub(size(R), idxMax);
+    pointPrompt = [px py];
+    
+    backgroundPoints = [
+        1 1;
+        round(wR/2) 1;
+        wR 1;
+        1 round(hR/2);
+        wR round(hR/2);
+        1 hR;
+        round(wR/2) hR;
+        wR hR
+    ];
+    
+    pointPromptG = [pointPrompt(1) + (x1-1), pointPrompt(2) + (y1-1)];
+    backgroundPointsG = [backgroundPoints(:,1) + (x1-1), backgroundPoints(:,2) + (y1-1)];
+    
+    Rsmall = imresize(R, scale, "bilinear");
+    R8 = uint8(255 .* rescale(Rsmall));
+    imageSize = size(R8);
+    
+    pointPromptS = round(pointPrompt * scale);
+    pointPromptS(1) = max(1, min(imageSize(2), pointPromptS(1)));
+    pointPromptS(2) = max(1, min(imageSize(1), pointPromptS(2)));
+    
+    backgroundPointsS = round(backgroundPoints * scale);
+    backgroundPointsS(:,1) = max(1, min(imageSize(2), backgroundPointsS(:,1)));
+    backgroundPointsS(:,2) = max(1, min(imageSize(1), backgroundPointsS(:,2)));
+    
+    embeddings = extractEmbeddings(model, R8);
+    [candMasks, scores_sam] = segmentObjectsFromEmbeddings(model, embeddings, imageSize, ...
+        ForegroundPoints=pointPromptS, BackgroundPoints=backgroundPointsS);
+    
+    if ndims(candMasks) == 3
+        [~,k] = max(scores_sam);
+        Msmall = candMasks(:,:,k);
+    else
+        Msmall = candMasks;
+    end
+    
+    Mroi = imresize(Msmall, [hR wR], "nearest");
+    
+    Mroi = imfill(Mroi, 'holes');
+    Mroi = bwareaopen(Mroi, 50);
+    
+    CC = bwconncomp(Mroi);
+    if CC.NumObjects > 1
+        stats = regionprops(CC, 'Area', 'Centroid');
+        cent = vertcat(stats.Centroid);
+        area = vertcat(stats.Area);
+        
+        c0 = [wR/2, hR/2];
+        d = hypot(cent(:,1)-c0(1), cent(:,2)-c0(2));
+        
+        [~, k] = max(area .* (1./(1+d)));
+        MroiTemp = false(size(Mroi));
+        MroiTemp(CC.PixelIdxList{k}) = true;
+        Mroi = MroiTemp;
+    end
+    
+    maskFull = false(H,W);
+    maskFull(y1:y2, x1:x2) = Mroi;
+    masks{i} = rot90(maskFull,2);
+    
+    subplot(2,5,i);
+    imagesc(Sn); axis image off; colormap gray; hold on;
+    rectangle('Position',[x1 y1 (x2-x1+1) (y2-y1+1)], 'EdgeColor','y', 'LineWidth',1);
+    contour(maskFull, [0.5 0.5], 'r', 'LineWidth', 1);
+    plot(pointPromptG(1), pointPromptG(2), 'g*');
+    plot(backgroundPointsG(:,1), backgroundPointsG(:,2), 'r*');
+    title(sprintf('Slice %d (z=%d)', i, z(i)));
+end
+
+fprintf('Segmentação SAM completa!\n');
